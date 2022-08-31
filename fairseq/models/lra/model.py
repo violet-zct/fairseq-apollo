@@ -18,7 +18,7 @@ from fairseq.models.lra.lstm_lra_encoder import LSTMLRAEncoder
 from fairseq.models.lra.flash_lra_encoder import FlashLRAEncoder
 from fairseq.models.lra.mega_lra_encoder import MegaLRAEncoder
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
-
+from fairseq.models.sru import SRUpp
 
 def Linear(in_features, out_features, bias=True):
     m = nn.Linear(in_features, out_features, bias)
@@ -120,6 +120,10 @@ class LRAModel(FairseqEncoderModel):
         parser.add_argument('--use-p', default=False, action='store_true',
                             help='use p for prediction')
 
+        # Arguments related to SRU
+        parser.add_argument('--attn-layer-norm', action="store_true")
+        parser.add_argument('--attention-every-n-layers', default=1, type=int)
+
         # misc params
         parser.add_argument('--activation-fn',
                             choices=utils.get_available_activation_fns(),
@@ -142,7 +146,7 @@ class LRAModel(FairseqEncoderModel):
         parser.add_argument('--quant-noise-scalar', type=float, metavar='D', default=0,
                             help='scalar quantization noise and scalar quantization at training time')
 
-        parser.add_argument('--layer-type', choices=['transformer', 'luna', 'lstm', 'flash', 'mega'])
+        parser.add_argument('--layer-type', choices=['transformer', 'luna', 'lstm', 'flash', 'mega', 'sru'])
         parser.add_argument('--norm-type', choices=['layernorm', 'scalenorm', 'rmsnorm', 'batchnorm', 'syncbatchnorm'])
         parser.add_argument('--normalize-embedding', action='store_true', help='normalize embedding for Mega.')
         parser.add_argument('--sen-rep-type', choices=['cls', 'mp'])
@@ -161,13 +165,23 @@ class LRAModel(FairseqEncoderModel):
     def forward(self, sample):
         src_tokens = sample['net_input']['src_tokens']
         src_lengths = sample['net_input']['src_lengths']
-        sentence_rep = self.encoder(src_tokens, src_lengths)
+        if self.layer_type == 'sru':
+            sentence_rep = self.encoder(src_tokens)
+        else:
+            sentence_rep = self.encoder(src_tokens, src_lengths)
         if not self.use_p:
             if self.layer_type in ['transformer', 'lstm', 'flash', 'mega']:
                 sentence_rep = sentence_rep[1]
+            elif self.layer_type == 'sru':
+                x = sentence_rep[0]
+                if self.sen_rep_type == 'mp':
+                    sentence_rep = x.sum(dim=0) / src_lengths.unsqueeze(1)
+                else:
+                    raise NotImplementedError
             elif self.layer_type == 'luna':
                 sentence_rep = sentence_rep[1][0]
         else:
+            # fixme for sru, not right
             sentence_rep = sentence_rep[1][1].mean(dim=0)
         if 'net_input1' in sample:
             src1_tokens = sample['net_input1']['src_tokens']
@@ -308,6 +322,24 @@ class LRAEncoder(FairseqEncoder):
                 max_seq_len=args.max_positions,
                 sen_rep_type=getattr(args, 'sen_rep_type', 'mp')
             )
+        elif args.layer_type == 'sru':
+            self.encoder = SRUpp(input_size=args.encoder_embed_dim,
+                                 hidden_size=args.encoder_hidden_dim,
+                                 proj_size=args.z_dim,
+                                 num_layers=args.encoder_layers,
+                                 dropout=args.dropout,
+                                 attn_dropout=args.attention_dropout,
+                                 bidirectional=True,
+                                 layer_norm=args.encoder_normalize_before,
+                                 normalize_after=not args.encoder_normalize_before,
+                                 attn_layer_norm=args.attn_layer_norm,
+                                 attention_every_n_layers=args.attention_every_n_layers,
+                                 highway_bias=-1,
+                                 embedding_type=embedding_type,
+                                 padding_idx=padding_idx,
+                                 vocab_size=vocab_size,
+                                 normalize_embedding=args.normalize_embedding,
+                                 norm_type=args.norm_type,)
         else:
             self.encoder = LunaLRAEncoder(
                 tie_layer_weights=getattr(args, 'tie_layer_weights', False),
@@ -655,4 +687,41 @@ def mega_lra_pf128(args):
     args.truncation_length = getattr(args, 'truncation_length', 4096)
     args.max_positions = getattr(args, 'max_positions', 128 * 128)
     args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
+    base_architecture(args)
+
+
+@register_model_architecture('lra', 'sru_lra_pf32')
+def sru_lra_pf32(args):
+    args.apply_bert_init = getattr(args, 'apply_bert_init', False)
+    args.layer_type = getattr(args, 'layer_type', 'sru')
+    args.encoder_hidden_dim = getattr(args, 'encoder_hidden_dim', 256)
+    args.z_dim = getattr(args, 'z_dim', 64)
+    args.encoder_layers = getattr(args, 'encoder_layers', 6)
+    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 128)
+    args.classifier_layers = getattr(args, 'classifier_layers', 1)
+    args.classifier_in_dim = getattr(args, "classifier_in_dim", args.encoder_hidden_dim * 2)
+    args.classifier_out_dim = getattr(args, 'classifier_out_dim', 512)
+    args.sentence_class_num = getattr(args, 'sentence_class_num', 2)
+    args.max_positions = getattr(args, 'max_positions', 1024)
+    args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
+    base_architecture(args)
+
+
+@register_model_architecture('lra', 'sru_lra_pf128')
+def sru_lra_pf128(args):
+    args.layer_type = getattr(args, 'layer_type', 'mega')
+    args.encoder_hidden_dim = getattr(args, 'encoder_hidden_dim', 128)
+    args.z_dim = getattr(args, 'z_dim', 32)
+    args.encoder_layers = getattr(args, 'encoder_layers', 4)
+    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 64)
+    args.norm_type = getattr(args, 'norm_type', 'batchnorm')
+    args.classifier_layers = getattr(args, 'classifier_layers', 1)
+    args.classifier_out_dim = getattr(args, 'classifier_out_dim', 128)
+    args.sentence_class_num = getattr(args, 'sentence_class_num', 2)
+    args.max_positions = getattr(args, 'max_positions', 128 * 128)
+    args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
+    args.classifier_in_dim = getattr(args, "classifier_in_dim", args.encoder_hidden_dim*2)
+    args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
+    args.attn_layer_norm = getattr(args, 'attn_layer_norm', False)
+    args.attention_every_n_layers = getattr(args, 'attention_every_n_layers', 1)
     base_architecture(args)
