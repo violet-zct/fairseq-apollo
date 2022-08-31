@@ -77,6 +77,7 @@ class Trainer(object):
                 _set_module_by_path(self._model, path, ref)
 
         self._dummy_batch = "DUMMY"  # indicates we don't have a dummy batch at first
+        self._dummy_valid_batch = "DUMMY"
         self._lr_scheduler = None
         self._num_updates = 0
         self._num_xla_compiles = 0  # for TPUs
@@ -355,21 +356,39 @@ class Trainer(object):
         subset,
     ):
         """Return an EpochBatchIterator over given validation subset for a given epoch."""
-        return self.task.get_batch_iterator(
-            dataset=self.task.dataset(subset),
-            max_tokens=self.args.max_tokens_valid,
-            max_sentences=self.args.max_sentences_valid,
-            max_positions=utils.resolve_max_positions(
-                self.task.max_positions(),
-                self.model.max_positions(),
-            ),
-            ignore_invalid_inputs=self.args.skip_invalid_size_inputs_valid_test,
-            required_batch_size_multiple=self.args.required_batch_size_multiple,
-            seed=self.args.seed,
-            num_shards=self.data_parallel_world_size,
-            shard_id=self.data_parallel_rank,
-            num_workers=self.args.num_workers,
-        )
+        if hasattr(self.task, 'is_mega_lm') and self.task.is_mega_lm:
+            return self.task.get_batch_iterator(
+                dataset=self.task.dataset(subset),
+                max_tokens=self.args.max_tokens_valid,
+                max_sentences=self.args.max_sentences_valid,
+                max_positions=utils.resolve_max_positions(
+                    self.task.max_positions(),
+                    self.model.max_positions(),
+                ),
+                ignore_invalid_inputs=self.args.skip_invalid_size_inputs_valid_test,
+                required_batch_size_multiple=self.args.required_batch_size_multiple,
+                seed=self.args.seed,
+                num_shards=self.data_parallel_world_size,
+                shard_id=self.data_parallel_rank,
+                num_workers=self.args.num_workers,
+                sharding=False,
+            )
+        else:
+            return self.task.get_batch_iterator(
+                dataset=self.task.dataset(subset),
+                max_tokens=self.args.max_tokens_valid,
+                max_sentences=self.args.max_sentences_valid,
+                max_positions=utils.resolve_max_positions(
+                    self.task.max_positions(),
+                    self.model.max_positions(),
+                ),
+                ignore_invalid_inputs=self.args.skip_invalid_size_inputs_valid_test,
+                required_batch_size_multiple=self.args.required_batch_size_multiple,
+                seed=self.args.seed,
+                num_shards=self.data_parallel_world_size,
+                shard_id=self.data_parallel_rank,
+                num_workers=self.args.num_workers,
+            )
 
     def begin_epoch(self, epoch):
         """Called at the beginning of each epoch."""
@@ -648,6 +667,80 @@ class Trainer(object):
         # gather logging outputs from all replicas
         if self.data_parallel_world_size > 1:
             logging_outputs, (sample_size, ) = self._aggregate_logging_outputs(
+                logging_outputs, sample_size, ignore=is_dummy_batch,
+            )
+
+        # log validation stats
+        logging_output = self._reduce_and_log_stats(logging_outputs, sample_size)
+
+        return logging_output
+
+    @metrics.aggregate("valid")
+    def mega_lm_valid_step(self, sample, raise_oom=False, incremental_states=None):
+        """Do forward pass in evaluation mode."""
+        if self._dummy_valid_batch == "DUMMY":
+            if sample:
+                self._dummy_valid_batch = sample
+            else:
+                dummy_train = self._dummy_batch
+                dummy_bsz = 2
+                chunk_size = self.args.decoder_chunk_size * dummy_bsz
+                pad = self.task.dictionary.pad()
+                self._dummy_valid_batch = {
+                        'id': dummy_train['id'].new(dummy_bsz).fill_(1),
+                        'nsentences': dummy_bsz,
+                        'ntokens': chunk_size * dummy_bsz,
+                        'net_input': {
+                            'src_tokens': dummy_train['net_input']['src_tokens'].new(dummy_bsz, chunk_size).fill_(pad),
+                            'src_lengths': dummy_train['net_input']['src_lengths'].new(dummy_bsz).fill_(chunk_size),
+                        },
+                        'target': dummy_train['target'].new(dummy_bsz, chunk_size).fill_(pad),
+                    }
+        if self.tpu:
+            import torch_xla.core.xla_model as xm
+            xm.rendezvous('valid_step')  # wait for all workers
+            xm.mark_step()
+
+        with torch.no_grad():
+            self.model.eval()
+            self.criterion.eval()
+
+            sample = self._prepare_sample(sample)
+            if sample is None:
+                sample = self._prepare_sample(self._dummy_valid_batch)
+                is_dummy_batch = True
+            else:
+                is_dummy_batch = False
+
+            try:
+                _loss, sample_size, logging_output = self.task.valid_step(
+                    sample, self.model, self.criterion, incremental_states=incremental_states
+                )
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    self._log_oom(e)
+                    if not raise_oom:
+                        logger.warning(
+                            "ran out of memory in validation step, retrying batch"
+                        )
+                        for p in self.model.parameters():
+                            if p.grad is not None:
+                                p.grad = None  # free some memory
+                        if self.cuda:
+                            torch.cuda.empty_cache()
+                        return self.valid_step(sample, raise_oom=True)
+                raise e
+
+            logging_outputs = [logging_output]
+            if is_dummy_batch:
+                if torch.is_tensor(sample_size):
+                    sample_size.zero_()
+                else:
+                    sample_size *= 0.
+
+        # gather logging outputs from all replicas
+        if self.data_parallel_world_size > 1:
+            logging_outputs, (sample_size,) = self._aggregate_logging_outputs(
                 logging_outputs, sample_size, ignore=is_dummy_batch,
             )
 

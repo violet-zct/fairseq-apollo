@@ -208,8 +208,12 @@ def make_positions(tensor, padding_idx: int, onnx_trace: bool = False):
     # balanced to both work with ONNX export and XLA. In particular XLA
     # prefers ints, cumsum defaults to output longs, and ONNX doesn't know
     # how to handle the dtype kwarg in cumsum.
-    mask = tensor.ne(padding_idx).int()
-    return (torch.cumsum(mask, dim=1).type_as(mask) * mask).long() + padding_idx
+    if padding_idx is not None:
+        mask = tensor.ne(padding_idx).int()
+        return (torch.cumsum(mask, dim=1).type_as(mask) * mask).long() + padding_idx
+    else:
+        mask = torch.ones_like(tensor, dtype=torch.int64)
+        return torch.cumsum(mask, dim=1) - 1
 
 
 def strip_pad(tensor, pad):
@@ -437,6 +441,24 @@ def import_user_module(args):
             importlib.import_module(module_name)
 
 
+def relu2(x, onnx_trace: bool = False):
+    if onnx_trace:
+        return torch.square(F.relu(x.float()))
+    else:
+        return torch.square(F.relu(x))
+
+
+# def erf(x):
+#     # return torch.tanh(1.128378 * x + 0.100917 * torch.pow(x, 3))
+#     return torch.erf(x)
+
+def laplace(x, mu=0.707107, sigma=0.282095, onnx_trace: bool = False):
+    if onnx_trace:
+        x = x.float()
+    x = (x - mu).div(sigma * math.sqrt(2.0))
+    return 0.5 * (1.0 + torch.erf(x))
+
+
 def softmax(x, dim: int, onnx_trace: bool = False):
     if onnx_trace:
         return F.softmax(x.float(), dim=dim)
@@ -478,8 +500,8 @@ def get_activation_fn(activation: str) -> Callable:
         return gelu_accurate
     elif activation == "gelu_accurate":
         return gelu_accurate
-    elif activation == "tanh":
-        return torch.tanh
+    elif activation == 'silu':
+        return F.silu
     elif activation == "linear":
         return lambda x: x
     else:
@@ -492,8 +514,8 @@ def get_available_activation_fns() -> List:
         "gelu",
         "gelu_fast",  # deprecated
         "gelu_accurate",
-        "tanh",
         "linear",
+        "silu",
     ]
 
 

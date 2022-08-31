@@ -271,6 +271,11 @@ def get_parser(desc, default_task="translation"):
                         help='path to quantization config file')
     parser.add_argument('--profile', action='store_true', help='enable autograd profiler emit_nvtx')
 
+    # wandb
+    parser.add_argument('--wandb-project', default=None, help='wandb project name')
+    parser.add_argument('--wandb-entity', default=None, help='wandb sending object, team name')
+    parser.add_argument('--wandb-id', default=None, help='wandb run id')
+
     from fairseq.registry import REGISTRIES
     for registry_name, REGISTRY in REGISTRIES.items():
         parser.add_argument(
@@ -358,6 +363,9 @@ def add_dataset_args(parser, train=False, gen=False):
                            help='data subset to use for training (e.g. train, valid, test)')
         group.add_argument('--valid-subset', default='valid', metavar='SPLIT',
                            help='comma separated list of data subsets to use for validation'
+                                ' (e.g. train, valid, test)')
+        group.add_argument('--test-subset', default='test', metavar='SPLIT',
+                           help='comma separated list of data subsets to use for test'
                                 ' (e.g. train, valid, test)')
         group.add_argument('--validate-interval', type=int, default=1, metavar='N',
                            help='validate every N epochs')
@@ -475,7 +483,7 @@ def add_optimization_args(parser):
                        metavar='LR_1,LR_2,...,LR_N',
                        help='learning rate for the first N epochs; all epochs >N using LR_N'
                             ' (note: this may be interpreted differently depending on --lr-scheduler)')
-    group.add_argument('--min-lr', default=-1, type=float, metavar='LR',
+    group.add_argument('--stop-min-lr', default=-1, type=float, metavar='LR',
                        help='stop training when the learning rate reaches this minimum')
     group.add_argument('--use-bmuf', default=False, action='store_true',
                        help='specify global optimizer for syncing models on different GPUs/shards')

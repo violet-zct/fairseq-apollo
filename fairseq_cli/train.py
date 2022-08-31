@@ -12,9 +12,12 @@ import logging
 import math
 import random
 import sys
+from typing import Dict, List, Optional
+import os
 
 import numpy as np
 import torch
+
 from fairseq import (
     checkpoint_utils,
     distributed_utils,
@@ -23,10 +26,17 @@ from fairseq import (
     tasks,
     utils,
 )
+from fairseq.file_io import PathManager
 from fairseq.data import iterators
 from fairseq.logging import meters, metrics, progress_bar
 from fairseq.model_parallel.megatron_trainer import MegatronTrainer
 from fairseq.trainer import Trainer
+from torch import Tensor
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 logging.basicConfig(
@@ -52,6 +62,14 @@ def main(args):
 
     if distributed_utils.is_master(args):
         checkpoint_utils.verify_checkpoint_directory(args.save_dir)
+
+        # wandb
+        if args.wandb_project and args.wandb_project != "none":
+            wandb.require(experiment="service")
+            resume_training = "must" if args.wandb_id is not None else None
+            wandb.init(project=args.wandb_project, reinit=False, name=os.environ.get(
+            "WANDB_NAME", os.path.basename(args.save_dir)), entity=args.wandb_entity, resume=resume_training,
+                       id=args.wandb_id)
 
     # Print args
     logger.info(args)
@@ -114,7 +132,7 @@ def main(args):
     train_meter = meters.StopwatchMeter()
     train_meter.start()
 
-    while lr > args.min_lr and epoch_itr.next_epoch_idx <= max_epoch:
+    while lr > args.stop_min_lr and epoch_itr.next_epoch_idx <= max_epoch:
         # train for one epoch
         valid_losses, should_stop = train(args, trainer, task, epoch_itr)
         if should_stop:
@@ -185,6 +203,14 @@ def train(args, trainer, task, epoch_itr):
             args.tensorboard_logdir if distributed_utils.is_master(args) else None
         ),
         default_log_format=("tqdm" if not args.no_progress_bar else "simple"),
+        wandb_project=(
+            args.wandb_project
+            if distributed_utils.is_master(args) and args.wandb_project != "none"
+            else None
+        ),
+        wandb_run_name=os.environ.get(
+            "WANDB_NAME", os.path.basename(args.save_dir)
+        ),
     )
 
     trainer.begin_epoch(epoch_itr.epoch)
@@ -244,7 +270,10 @@ def validate_and_save(args, trainer, task, epoch_itr, valid_subsets, end_of_epoc
     # Validate
     valid_losses = [None]
     if do_validate:
-        valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets)
+        if hasattr(task, 'is_mega_lm') and task.is_mega_lm:
+            valid_losses = validate_mega_lm(args, trainer, task, epoch_itr, valid_subsets)
+        else:
+            valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets)
 
     # Stopping conditions
     max_update = args.max_update or math.inf
@@ -295,6 +324,14 @@ def validate(args, trainer, task, epoch_itr, subsets):
                 args.tensorboard_logdir if distributed_utils.is_master(args) else None
             ),
             default_log_format=("tqdm" if not args.no_progress_bar else "simple"),
+            wandb_project=(
+                args.wandb_project
+                if distributed_utils.is_master(args) and args.wandb_project != "none"
+                else None
+            ),
+            wandb_run_name=os.environ.get(
+                "WANDB_NAME", os.path.basename(args.save_dir)
+            ),
         )
 
         # create a new root metrics aggregator so validation metrics
@@ -308,6 +345,82 @@ def validate(args, trainer, task, epoch_itr, subsets):
         progress.print(stats, tag=subset, step=trainer.get_num_updates())
 
         valid_losses.append(stats[args.best_checkpoint_metric])
+    return valid_losses
+
+
+def validate_mega_lm(args, trainer, task, epoch_itr, subsets):
+    """Evaluate the model on the validation set(s) and return the losses.
+       Validate for language modeling task, specifically mega LM. """
+
+    if args.fixed_validation_seed is not None:
+        # set fixed seed for every validation
+        utils.set_torch_seed(args.fixed_validation_seed)
+
+    valid_losses = []
+    for subset in subsets:
+        logger.info('begin validation on "{}" subset'.format(subset))
+
+        # Initialize data iterator
+        itr = trainer.get_valid_iterator(subset).next_epoch_itr(shuffle=False)
+        if getattr(args, "tpu", False):
+            itr = utils.tpu_data_loader(itr)
+        progress = progress_bar.progress_bar(
+            itr,
+            log_format=args.log_format,
+            log_interval=args.log_interval,
+            epoch=epoch_itr.epoch,
+            prefix=f"valid on '{subset}' subset",
+            tensorboard_logdir=(
+                args.tensorboard_logdir if distributed_utils.is_master(args) else None
+            ),
+            default_log_format=("tqdm" if not args.no_progress_bar else "simple"),
+            wandb_project=(
+                args.wandb_project
+                if distributed_utils.is_master(args) and args.wandb_project != "none"
+                else None
+            ),
+            wandb_run_name=os.environ.get(
+                "WANDB_NAME", os.path.basename(args.save_dir)
+            ),
+        )
+
+        chunk_size = args.decoder_chunk_size
+
+        # create a new root metrics aggregator so validation metrics
+        # don't pollute other aggregators (e.g., train meters)
+        with metrics.aggregate(new_root=True) as agg:
+            for sample in progress:
+                # todo: recalculate a larger tokens_per_batch at validation time
+                if not sample:
+                    for _ in range(0, chunk_size, chunk_size):
+                        incremental_states = torch.jit.annotate(Dict[str, Dict[str, Optional[Tensor]]], {})
+                        trainer.mega_lm_valid_step(sample, incremental_states=incremental_states)
+                    continue
+
+                # a specific assertion for debugging
+                total_size = sample['net_input']['src_tokens'].size(1)
+                batch_size = len(sample['net_input']['src_lengths'])
+                incremental_states = torch.jit.annotate(Dict[str, Dict[str, Optional[Tensor]]], {})
+
+                for i in range(0, total_size, chunk_size):
+                    new_sample = {
+                        'id': sample['id'],
+                        'nsentences': sample['nsentences'],
+                        'ntokens': sample['target'][:, i: i + chunk_size].ne(task.dictionary.pad()).sum(),
+                        'net_input': {
+                            'src_tokens': sample['net_input']['src_tokens'][:, i: i+chunk_size],
+                            'src_lengths': sample['net_input']['src_tokens'].ne(task.dictionary.pad()).sum(1),
+                        },
+                        'target': sample['target'][:, i: i+chunk_size],
+                    }
+                    trainer.mega_lm_valid_step(new_sample, incremental_states=incremental_states)
+
+        # log validation stats
+        stats = get_valid_stats(args, trainer, agg.get_smoothed_values())
+        progress.print(stats, tag=subset, step=trainer.get_num_updates())
+
+        valid_losses.append(stats[args.best_checkpoint_metric])
+        trainer.model.analyze_ema(report=True)
     return valid_losses
 
 

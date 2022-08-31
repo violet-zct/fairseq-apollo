@@ -12,6 +12,7 @@ from .base_wrapper_dataset import BaseWrapperDataset
 from .add_target_dataset import AddTargetDataset
 from .append_token_dataset import AppendTokenDataset
 from .audio.raw_audio_dataset import FileAudioDataset
+from .audio.speech_commands_dataset import SpeechCommandsDataset
 from .backtranslation_dataset import BacktranslationDataset
 from .bucket_pad_length_dataset import BucketPadLengthDataset
 from .colorize_dataset import ColorizeDataset
@@ -33,6 +34,7 @@ from .numel_dataset import NumelDataset
 from .num_samples_dataset import NumSamplesDataset
 from .offset_tokens_dataset import OffsetTokensDataset
 from .pad_dataset import LeftPadDataset, PadDataset, RightPadDataset
+from .pixel_sequence_dataset import PixelSequenceDataset
 from .prepend_dataset import PrependDataset
 from .prepend_token_dataset import PrependTokenDataset
 from .raw_label_dataset import RawLabelDataset
@@ -92,6 +94,7 @@ __all__ = [
     'NumSamplesDataset',
     'OffsetTokensDataset',
     'PadDataset',
+    'PixelSequenceDataset',
     'PrependDataset',
     'PrependTokenDataset',
     'ReplaceDataset',
@@ -106,6 +109,7 @@ __all__ = [
     'ShardedIterator',
     'SortDataset',
     'StripTokenDataset',
+    'SpeechCommandsDataset',
     'SubsampleDataset',
     'TokenBlockDataset',
     'TokenBlockMixtureDataset',
