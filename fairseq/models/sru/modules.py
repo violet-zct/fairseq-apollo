@@ -1051,7 +1051,7 @@ class SRUpp(nn.Module):
             self.padding_idx = padding_idx
             self.vocab_size = vocab_size
             # self.embedding_dropout = FairseqDropout(dropout, module_name=self.__class__.__name__)
-            self.embed_tokens = self.build_embedding(self.embedding_type, self.embedding_dim,
+            self.embed_tokens = self.build_embedding(self.embedding_type, self.input_size,
                                                     self.vocab_size, self.padding_idx)
             # assert not normalize_embedding or not layer_norm
             # self.embed_norm = SequenceNorm(norm_type, input_size) if normalize_embedding else None

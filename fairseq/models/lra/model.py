@@ -332,14 +332,11 @@ class LRAEncoder(FairseqEncoder):
                                  bidirectional=True,
                                  layer_norm=args.encoder_normalize_before,
                                  normalize_after=not args.encoder_normalize_before,
-                                 attn_layer_norm=args.attn_layer_norm,
                                  attention_every_n_layers=args.attention_every_n_layers,
                                  highway_bias=-1,
                                  embedding_type=embedding_type,
                                  padding_idx=padding_idx,
-                                 vocab_size=vocab_size,
-                                 normalize_embedding=args.normalize_embedding,
-                                 norm_type=args.norm_type,)
+                                 vocab_size=vocab_size, )
         else:
             self.encoder = LunaLRAEncoder(
                 tie_layer_weights=getattr(args, 'tie_layer_weights', False),
@@ -369,7 +366,10 @@ class LRAEncoder(FairseqEncoder):
             )
 
     def forward(self, src_tokens, src_lengths=None, **kwargs):
-        return self.encoder(src_tokens, src_lengths, last_state_only=True)
+        if self.args.layer_type == 'sru':
+            return self.encoder(src_tokens)
+        else:
+            return self.encoder(src_tokens, src_lengths, last_state_only=True)
 
 
 @register_model_architecture('lra', 'lra')
@@ -692,7 +692,6 @@ def mega_lra_pf128(args):
 
 @register_model_architecture('lra', 'sru_lra_pf32')
 def sru_lra_pf32(args):
-    args.apply_bert_init = getattr(args, 'apply_bert_init', False)
     args.layer_type = getattr(args, 'layer_type', 'sru')
     args.encoder_hidden_dim = getattr(args, 'encoder_hidden_dim', 256)
     args.z_dim = getattr(args, 'z_dim', 64)
@@ -714,7 +713,6 @@ def sru_lra_pf128(args):
     args.z_dim = getattr(args, 'z_dim', 32)
     args.encoder_layers = getattr(args, 'encoder_layers', 4)
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 64)
-    args.norm_type = getattr(args, 'norm_type', 'batchnorm')
     args.classifier_layers = getattr(args, 'classifier_layers', 1)
     args.classifier_out_dim = getattr(args, 'classifier_out_dim', 128)
     args.sentence_class_num = getattr(args, 'sentence_class_num', 2)
@@ -722,6 +720,5 @@ def sru_lra_pf128(args):
     args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
     args.classifier_in_dim = getattr(args, "classifier_in_dim", args.encoder_hidden_dim*2)
     args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
-    args.attn_layer_norm = getattr(args, 'attn_layer_norm', False)
     args.attention_every_n_layers = getattr(args, 'attention_every_n_layers', 1)
     base_architecture(args)
